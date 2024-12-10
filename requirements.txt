@@ -1,0 +1,7 @@
+fastapi
+pydantic
+re
+logging
+transformers
+natasha
+time
