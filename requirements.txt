@@ -5,3 +5,5 @@ logging
 transformers
 natasha
 time
+uvicorn
+torch
