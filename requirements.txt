@@ -6,7 +6,6 @@ transformers
 natasha
 time
 torch
-razdel
 nltk
 pymorphy3
 spacy
