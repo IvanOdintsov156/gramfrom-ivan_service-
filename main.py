@@ -1,203 +1,175 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import re
-import logging
+import torch
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-from natasha import (
-    Segmenter,
-    MorphVocab,
-    NewsEmbedding,
-    NewsMorphTagger,
-    Doc
-)
+import nltk
+from nltk.tokenize import word_tokenize
+import re
+import pymorphy3
 import time
+import spacy
+import pandas as pd
+import random
+from kafka_logger import log_event  # Импортируем модуль для логирования
 
-app = FastAPI()
+# Загрузка необходимых ресурсов для nltk
+nltk.download('punkt')
+nltk.download('averaged_perceptron_tagger_ru')
+nltk.download('punkt_tab')  # Загрузка punkt_tab для русской токенизации
 
-# Настройка логирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
-# Загрузка модели и токенизатора
-model_name = "ai-forever/sage-fredt5-distilled-95m"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+grammar_correction_times = []
 
-# Инициализация морфологического анализатора
-segmenter = Segmenter()
-morph_vocab = MorphVocab()
-emb = NewsEmbedding()
-morph_tagger = NewsMorphTagger(emb)
+# Инициализация токенизатора и модели
+device = "cuda" if torch.cuda.is_available() else "cpu"
+MAX_LENGTH = 512
+morph = pymorphy3.MorphAnalyzer()
 
-# Исключения для слов, которые не требуют проверки на существительное
-exclusions = {"направляющая", "санки", "салазки"}
+# Загрузка модели spaCy для русского языка
+nlp = spacy.load("ru_core_news_sm")
 
-class CheckRequest(BaseModel):
-    name: str
+def normalize_name(text, max_length=MAX_LENGTH):
+    """Нормализует наименование товара."""
+    original_case = text
+    modified = False
 
-class CheckResponse(BaseModel):
-    original_name: str
-    has_error: bool
-    errors: list[dict]
-    corrected_name: str
-    statistics: dict
+    log_event("Запуск нормализации наименования.")  # Логирование начала нормализации
 
-def correct_morphology(text):
-    """Исправляет морфологические ошибки в тексте с помощью модели NLP."""
-    inputs = tokenizer(text, return_tensors="pt", max_length=512, truncation=True)
-    outputs = model.generate(**inputs)
-    corrected_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return corrected_text
+    # Проверка, состоит ли ввод только из размеров и кодов
+    if re.match(r"^[\d\*\-a-zA-Z\s]+$", text) and not re.search(r"[а-яА-Я]", text):
+        return pd.Series([text, modified], index=['Наименование(нормализованное)', 'Modified'])
 
-def fix_leet(text):
-    """Исправляет leet-замену в тексте, сохраняя капитализацию."""
-    leet_map = {
-        '4': 'A',
-        '3': 'E',
-        '1': 'I',
-        '0': 'O',
-        '5': 'S',
-        '7': 'T'
-    }
-    return ''.join(leet_map.get(char.lower(), char) if char.islower() else leet_map.get(char.lower(), char) for char in text)
+    # 1. Очистка текста и удаление нежелательных префиксов
+    rule_start_time = time.time_ns()
+    text = text.replace('ё', 'е')
 
-def check_name(name):
-    """Проверяет наименование по правилам и возвращает результат."""
-    result = {
-        'original_name': name,
-        'errors': [],
-        'corrected_name': name
-    }
+    # Удаление префиксов на основе NLP
+    doc = nlp(text)
+    prefixes_to_remove = [token.text for token in doc if re.match(r'^![а-яА-Я]+$', token.text)]
+    for prefix in prefixes_to_remove:
+        text = text.replace(prefix, '').strip()
 
-    rule_times = {
-        'fix_leet': 0,
-        'clean_text': 0,
-        'correct_morphology': 0,
-        'check_length': 0,
-        'check_start_with_noun': 0,
-        'check_grammar': 0,
-        'check_forbidden_chars': 0,
-        'check_extra_spaces': 0,
-        'check_letter_e': 0,
-        'check_quotation_marks': 0,
-        'check_latin_chars': 0
-    }
+    # Удаление нежелательных символов
+    text = re.sub(r"[@\{\}\|,°×\'^~‰üµαβ≤≥©®ø]", "", text)
+    text = re.sub(r'\s+', ' ', text).strip()
 
-    # Исправление leet-замен
-    start_time = time.time()
-    cleaned_name = fix_leet(name)
-    rule_times['fix_leet'] = time.time() - start_time
+    logger.info(f"Rule 'cleanup' applied to {text} (took {time.time_ns() - rule_start_time} ns)")
 
-    # Очистка текста от ненужных символов
-    start_time = time.time()
-    cleaned_name = re.sub(r'[@{}\|°×\'^~‰ü°µαβ≤≥©®ø_]', '', cleaned_name)
-    cleaned_name = re.sub(r'\s+', ' ', cleaned_name).strip()
-    cleaned_name = cleaned_name.replace('ё', 'е')
-    cleaned_name = re.sub(r'["“”«»]', '', cleaned_name)
-    cleaned_name = re.sub(r'[A-Za-z]', '', cleaned_name)
-    rule_times['clean_text'] = time.time() - start_time
+    # 2. NLP-based restructuring and grammar correction
+    doc = nlp(text)
+    noun_phrase = ""
+    other_parts = []
 
-    # Проверка грамматических ошибок
-    start_time = time.time()
-    if not re.match(r'^[А-Яа-я\s]+$', cleaned_name):
-        result['errors'].append({'error': 'Грамматическая ошибка', 'corrected': cleaned_name})
-    else:
-        corrected_name = correct_morphology(cleaned_name)
-        if cleaned_name != corrected_name:
-            result['errors'].append({'error': 'Морфологическая ошибка', 'corrected': corrected_name})
-            cleaned_name = corrected_name
-    rule_times['correct_morphology'] = time.time() - start_time
+    for token in doc:
+        if token.pos_ == "NOUN":
+            noun_phrase = token.text
+            for child in token.children:
+                if child.dep_ in ["amod", "nmod"]:
+                    child_parsed = morph.parse(child.text)[0]
+                    token_parsed = morph.parse(token.text)
+                    if token_parsed and token_parsed[0].tag.case:
+                        child_inflected = child_parsed.inflect({token_parsed[0].tag.case})
+                        noun_phrase += " " + child_inflected.word if child_inflected else " " + child.text
+                    else:
+                        noun_phrase += " " + child.text
+            break
 
-    # Проверка длины наименования
-    start_time = time.time()
-    if len(cleaned_name) > 256:
-        result['errors'].append({'error': 'Длина наименования превышает допустимую норму', 'corrected': cleaned_name[:256]})
-        cleaned_name = cleaned_name[:256]
-    rule_times['check_length'] = time.time() - start_time
+        other_parts = [token.text for token in doc if token.text not in noun_phrase.split()]
+        other_parts = [part for part in other_parts if not re.match(r"^\d{1,2}-[а-яА-Яa-zA-Z]+\s?$", part)]
 
-    # Проверка на начало с существительного в единственном числе
-    start_time = time.time()
-    doc = Doc(cleaned_name)
-    doc.segment(segmenter)
-    doc.tag_morph(morph_tagger)
-    doc.tokens = [token for token in doc.tokens if token.text.lower() not in exclusions]
+        text = noun_phrase + " " + " ".join(other_parts)
 
-    if doc.tokens:
-        first_token = doc.tokens[0]
-        if not (first_token.pos == 'NOUN' and 'Sing' in first_token.feats):
-            result['errors'].append({'error': 'Наименование должно начинаться с существительного в единственном числе', 'corrected': cleaned_name})
-    rule_times['check_start_with_noun'] = time.time() - start_time
+        text = re.sub(r"(\d+)\s+(\d+)\s+(\d+)", r"\1*\2*\3", text)
+        text = re.sub(r"(\d+)\s+(\d+)", r"\1*\2", text)
 
-    # Проверка на наличие запрещенных символов
-    start_time = time.time()
-    if re.search(r'[@{}\|°×\'^~‰ü°µαβ≤≥©®ø_]', cleaned_name):
-        result['errors'].append({'error': 'Наличие запрещенных символов', 'corrected': cleaned_name})
-    rule_times['check_forbidden_chars'] = time.time() - start_time
+    # 4. Коррекция грамматики
+    rule_start_time = time.time_ns()
+    words = word_tokenize(text, language='russian')
+    corrected_words = []
+    for word in words:
+        if not re.match(r"^\d{2,3}\*\d{2,3}\*\d{1,2}-[а-яА-Яa-zA-Z]?$", word) and \
+           not re.match(r"^\d{3,}-\d{3,}-\d{3,}-[а-яА-Яa-zA-Z]?", word):
+            parsed_word = morph.parse(word)[0]
+            if 'NOUN' in parsed_word.tag and 'sing' in parsed_word.tag:
+                corrected_words.append(parsed_word.normal_form)
+            else:
+                corrected_words.append(word)
+        else:
+            corrected_words.append(word)
 
-    # Проверка на наличие лишних пробелов
-    start_time = time.time()
-    if re.search(r'\s{2,}', cleaned_name):
-        result['errors'].append({'error': 'Наличие лишних пробелов', 'corrected': re.sub(r'\s{2,}', ' ', cleaned_name).strip()})
-    rule_times['check_extra_spaces'] = time.time() - start_time
+    text = " ".join(corrected_words)
 
-    # Проверка на использование буквы "ё"
-    start_time = time.time()
-    if 'ё' in cleaned_name:
-        result['errors'].append({'error': 'Использование буквы "ё"', 'corrected': cleaned_name.replace('ё', 'е')})
-    rule_times['check_letter_e'] = time.time() - start_time
+    logger.info(f"Rule 'grammar_correction' applied to {text} (took {time.time_ns() - rule_start_time} ns)")
 
-    # Проверка на использование кавычек
-    start_time = time.time()
-    if re.search(r'["“”«»]', cleaned_name):
-        result['errors'].append({'error': 'Использование кавычек', 'corrected': re.sub(r'["“”«»]', '', cleaned_name)})
-    rule_times['check_quotation_marks'] = time.time() - start_time
+    # Валидация
+    rule_start_time = time.time_ns()
+    text = re.sub(r"[^a-zA-Zа-яА-Я0-9\s.,\-]+", "", text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    text = re.sub(r"\.$", "", text)
+    text = correct_grammar(text)
 
-    # Проверка на использование букв латинского алфавита
-    start_time = time.time()
-    if re.search(r'[A-Za-z]', cleaned_name):
-        result['errors'].append({'error': 'Использование букв латинского алфавита', 'corrected': re.sub(r'[A-Za-z]', '', cleaned_name)})
-    rule_times['check_latin_chars'] = time.time() - start_time
+    logger.info(f"Rule 'validation' applied to {text} (took {time.time_ns() - rule_start_time} ns)")
 
-    result['corrected_name'] = cleaned_name
-    return result, rule_times
+    # Восстановление регистра
+    rule_start_time = time.time_ns()
+    normalized_text = ""
+    original_index = 0
+    for i, char in enumerate(text):
+        if original_index < len(original_case) and char.lower() == original_case[original_index].lower():
+            normalized_text += original_case[original_index]
+            original_index += 1
+        else:
+            normalized_text += char
 
-@app.post("/check_name", response_model=CheckResponse)
-def check_name_endpoint(request: CheckRequest):
-    start_time = time.time()
-    result, rule_times = check_name(request.name)
-    total_time = time.time() - start_time
+    logger.info(f"Rule 'case_restoration' applied to {text} (took {time.time_ns() - rule_start_time} ns)")
 
-    # Логирование метрик
-    statistics = {
-        'Среднее время обработки одной записи': total_time,
-        'Среднее время обработки правила fix_leet': rule_times['fix_leet'],
-        'Среднее время обработки правила clean_text': rule_times['clean_text'],
-        'Среднее время обработки правила correct_morphology': rule_times['correct_morphology'],
-        'Среднее время обработки правила check_length': rule_times['check_length'],
-        'Среднее время обработки правила check_start_with_noun': rule_times['check_start_with_noun'],
-        'Среднее время обработки правила check_grammar': rule_times['check_grammar'],
-        'Среднее время обработки правила check_forbidden_chars': rule_times['check_forbidden_chars'],
-        'Среднее время обработки правила check_extra_spaces': rule_times['check_extra_spaces'],
-        'Среднее время обработки правила check_letter_e': rule_times['check_letter_e'],
-        'Среднее время обработки правила check_quotation_marks': rule_times['check_quotation_marks'],
-        'Среднее время обработки правила check_latin_chars': rule_times['check_latin_chars']
-    }
+    modified = normalized_text != original_case
 
-    has_error = bool(result['errors'])
+    return pd.Series([normalized_text, modified], index=['Наименование(нормализованное)', 'Modified'])
 
-    if has_error:
-        logger.info(f"Обработка записи с ошибками: {request.name} - {total_time} сек")
-    else:
-        logger.info(f"Обработка записи без ошибок: {request.name} - {total_time} сек")
+def correct_grammar(sentence):
+    """Корректирует грамматику с использованием моделей."""
+    tokenizer_sage = AutoTokenizer.from_pretrained("ai-forever/sage-fredt5-large")
+    model_sage = AutoModelForSeq2SeqLM.from_pretrained("ai-forever/sage-fredt5-large")
 
-    return CheckResponse(
-        original_name=result['original_name'],
-        has_error=has_error,
-        errors=result['errors'],
-        corrected_name=result['corrected_name'],
-        statistics=statistics
-    )
+    inputs_sage = tokenizer_sage(sentence, max_length=None, padding="longest", truncation=False, return_tensors="pt")
+    outputs_sage = model_sage.generate(**inputs_sage.to(model_sage.device), max_length=inputs_sage["input_ids"].size(1) * 1.5)
+    corrected_sentence_sage = tokenizer_sage.batch_decode(outputs_sage, skip_special_tokens=True)[0]
+    print(f"Результат после sage-fredt5-large: {corrected_sentence_sage}")
+
+    return corrected_sentence_sage
+
+def process_excel_column(excel_file, column_name):
+    """Обрабатывает указанный столбец в Excel файле и применяет нормализацию."""
+    df = pd.read_excel(excel_file)
+
+    log_event("Начало обработки столбца Excel.")  # Логирование начала обработки столбца
+
+    df[['Наименование(нормализованное)', 'Modified']] = df[column_name].apply(lambda x: pd.Series(normalize_name(x)))
+
+    df['Ошибка'] = df['Modified'].apply(lambda x: 'ИСТИНА' if x else 'ЛОЖЬ')
+    df = df.drop(columns=['Modified'])
+
+    log_event("Завершение обработки столбца Excel.")  # Логирование завершения обработки
+
+    return df[[column_name, 'Наименование(нормализованное)', 'Ошибка']]
+
+def main():
+    """Основная функция для выполнения обработки данных."""
+    excel_file = '10записей.xlsx'
+    column_name = 'Наименование(ненормализованное)'
+
+    log_event("Начало обработки Excel файла.")  # Логирование начала обработки файла
+    result_df = process_excel_column(excel_file, column_name)
+
+    total_records = len(result_df)
+    correct_original_names = result_df['Ошибка'][result_df['Ошибка'] == 'ИСТИНА'].count()
+    percentage_original = (correct_original_names / total_records) * 100
+
+    result_df.loc[len(result_df)] = [f"Процент корректно нормализованных записей (оригинальные): {percentage_original:.2f}%", "", ""]
+    
+    result_df.to_excel('normalized_names.xlsx', index=False)
+    print(result_df)
+
+    log_event("Завершение обработки Excel файла.")  # Логирование завершения обработки файла
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    main()
