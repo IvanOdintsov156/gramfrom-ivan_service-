@@ -1,5 +1,7 @@
 import torch
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from transformers import pipeline
+from sentence_transformers import SentenceTransformer, util
+
 import nltk
 from nltk.tokenize import word_tokenize
 import re
@@ -8,7 +10,11 @@ import logging
 import time
 import spacy
 import pandas as pd
-
+from IPython.display import display, clear_output
+pd.set_option('display.max_columns', None)  # Show all columns
+pd.set_option('display.max_rows', None)  # Show all rows
+pd.set_option('display.width', None)  # Auto-detect the width for the terminal
+pd.set_option('display.max_colwidth', None) # Prevent column truncation
 # Download necessary resources for nltk
 nltk.download('punkt')
 nltk.download('averaged_perceptron_tagger_ru')
@@ -19,121 +25,103 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Initialize tokenizer and model
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cpu"
 MAX_LENGTH = 512
 morph = pymorphy3.MorphAnalyzer()
-
+# Spell check dictionary
+spell_check_dict = {
+         "Риле": "Реле",
+         "кантакта": "контакта",
+         "Релень": "Ремень",  # Add "Релень" to the dictionary
+         "Хамут": "Хомут",
+         "Релень": "Ремень"  
+     }
 # Load spaCy Russian model
 nlp = spacy.load("ru_core_news_sm")
-
+grammar_pipeline = pipeline("text2text-generation", model="ai-forever/sage-fredt5-large")
 def normalize_name(text, max_length=MAX_LENGTH):
     """Нормализует наименование товара."""
     original_case = text
     modified = False
 
-    # 1. Очистка текста и удаление нежелательных символов
-    text = text.replace('ё', 'е')
-    doc = nlp(text)
-
-    # Удаление нежелательных символов
-    text = re.sub(r"[@\{\}\|,°×\'^~‰üµαβ≤≥©®ø]", "", text)
-    text = re.sub(r'\s+', ' ', text).strip()
-
-    logger.info(f"Cleanup applied to {text}")
-
-     # 3. Коррекция грамматики
-    text = correct_grammar(text)
+    text = re.sub(r"(\d+)\s*\*\s*(\d+)\s*\*\s*(\d+)", r"\1*\2*\3", text)
 
 
- # 2. NLP-based restructuring (modified) - Now more selective
-    doc = nlp(text)
+    # 2. Grammar correction
+    corrected_text = grammar_pipeline(text, max_length=max_length)[0]['generated_text']
+    text = reorder_name(corrected_text, original_case)
 
-    # Check if the text starts with an adjective followed by a noun or a single noun
-    starts_with_adj_noun = False
-    if len(doc) >= 2 and doc[0].pos_ == "ADJ" and doc[1].pos_ == "NOUN":
-        starts_with_adj_noun = True
+    for misspelled, correct in spell_check_dict.items():
+         text = text.replace(misspelled, correct)
 
-    starts_with_noun = False
-    if len(doc) > 0 and doc[0].pos_ == "NOUN":
-        starts_with_noun = True
-
-    # Restructure only in specific cases to avoid unnecessary changes
-    if not starts_with_adj_noun and not starts_with_noun and not re.fullmatch(r"[\d\*\-a-zA-Z\s,\(\)]+", text) and any(token.pos_ == "NOUN" for token in doc):
-        noun_phrase = ""
-        other_parts = []
-
-        # Find the main noun (head of the noun phrase)
-        main_noun = None
-        for token in doc:
-            if token.pos_ == "NOUN" and token.dep_ == "ROOT":
-                main_noun = token
-                break
-
-        # If a main noun is found, build the noun phrase
-        if main_noun:
-            noun_phrase = main_noun.text
-
-            # Process children only if they are ADJ or NOUN modifiers
-            relevant_children = [child for child in main_noun.children if child.dep_ in ["amod", "nmod"] and not child.like_num and child.pos_ in ["ADJ", "NOUN"]]
-
-            if relevant_children:  # Proceed only if there are relevant children
-                for child in relevant_children:
-                    child_parsed = morph.parse(child.text)[0]
-
-                    # Get case from spaCy and map to pymorphy3 format
-                    spacy_case = main_noun.morph.get("Case")
-                    pymorphy_case = {'Nom': 'nomn', 'Gen': 'gent', 'Dat': 'datv', 'Acc': 'accs', 'Ins': 'ablt', 'Loc': 'loct'}.get(spacy_case[0] if spacy_case else None)
-
-                    # Inflect if pymorphy_case is valid and the child is inflectable
-                    child_inflected = child_parsed.inflect({pymorphy_case}) if pymorphy_case else None
-
-                    # Add the inflected child to the noun phrase, prepending or appending based on dependency
-                    if child_inflected and child.dep_ == 'amod':  # Prepend adjectives
-                        noun_phrase = child_inflected.word + " " + noun_phrase
-                    elif child_inflected:  # Append other modifiers
-                        noun_phrase += " " + child_inflected.word
-                    else:
-                         # Append original if not inflectable
-                         noun_phrase += " " + child.text
-
-        # Extract other parts, excluding numbers
-        if noun_phrase:
-            other_parts = [token.text for token in doc if token.text not in noun_phrase.split() and not token.like_num]
-        else:
-            other_parts = [token.text for token in doc if not token.like_num]
-
-        # Reconstruct the normalized name, moving the noun phrase to the beginning
-        text = noun_phrase + " " + " ".join(other_parts)
-
-    modified = text != original_case
 
     return pd.Series([text, modified], index=['Наименование(нормализованное)', 'Modified'])
 
 
-def correct_grammar(sentence):
-    """Корректирует грамматику с помощью предобученной модели."""
-    tokenizer = AutoTokenizer.from_pretrained("ai-forever/sage-fredt5-large")
-    model = AutoModelForSeq2SeqLM.from_pretrained("ai-forever/sage-fredt5-large")
+def reorder_name(text, original_case):
+    """Reorders the words in the text, preserving original case."""
+    doc = nlp(text)
+    noun_phrase = ""
+    other_parts = []
 
-    inputs = tokenizer(sentence, max_length=None, padding="longest", truncation=False, return_tensors="pt")
-    outputs = model.generate(**inputs.to(model.device), max_length=inputs["input_ids"].size(1) * 1.5)
-    corrected_sentence = tokenizer.batch_decode(outputs, skip_special_tokens=True)[0]
+    # 1. Identify the main noun phrase
+    for token in doc:
+        if token.pos_ == "NOUN":
+            noun_phrase = token.text
+            for child in token.children:
+                if child.dep_ in ["amod", "nmod"]:
+                    child_parsed = morph.parse(child.text)[0]
+                    token_parsed = morph.parse(token.text)
+                    if token_parsed and token_parsed[0].tag.case:
+                        child_inflected = child_parsed.inflect({token_parsed[0].tag.case})
+                        noun_phrase += " " + child_inflected.word if child_inflected else " " + child.text
+                    else:
+                        noun_phrase += " " + child.text
+            break
 
-    return corrected_sentence
+    # 2. Gather other parts of the name
+    other_parts = [token.text for token in doc if token.text not in noun_phrase.split()]
+
+    # 3. Remove original patterns (e.g., "1-шт") if present
+    other_parts = [part for part in other_parts if not re.match(r"^\d{1,2}-[а-яА-Яa-zA-Z]+\s?$", part)]
+
+    # 4. Reconstruct the normalized name
+    text = noun_phrase + " " + " ".join(other_parts)
+    
+    # 5. Capitalize only the first letter
+    text = text[0].upper() + text[1:]
+    
+    return text # Return the reordered name
+
+
+    
 
 def process_excel_column(excel_file, column_name):
     """Обрабатывает указанный столбец в Excel-файле и применяет нормализацию."""
     df = pd.read_excel(excel_file)
+    
+    processed_rows = []
 
-    # Применяем нормализацию и получаем статус изменений
-    df[['Наименование(нормализованное)', 'Modified']] = df[column_name].apply(lambda x: pd.Series(normalize_name(x)))
+    for index, row in df.iterrows():
+        normalized_data = normalize_name(row[column_name])
+        
+        processed_row = {
+            column_name: row[column_name],
+            'Наименование(нормализованное)': normalized_data['Наименование(нормализованное)'],
+            'Ошибка': 'ИСТИНА' if normalized_data['Modified'] else 'ЛОЖЬ' 
+        }
+        
+        processed_rows.append(processed_row)
+        
+        current_df = pd.DataFrame(processed_rows)
+        
+        # Clear previous output and display the updated table
+        clear_output(wait=True) 
+        display(current_df)
+        
+    result_df = current_df
 
-    # Устанавливаем 'Ошибка' на основе статуса изменений
-    df['Ошибка'] = df['Modified'].apply(lambda x: 'ИСТИНА' if x else 'ЛОЖЬ')
-
-    df = df.drop(columns=['Modified'])  # Удаляем временный столбец 'Modified'
-
-    return df[[column_name, 'Наименование(нормализованное)', 'Ошибка']]
+    return result_df
 
 def main():
     """Основная функция для выполнения обработки данных."""
