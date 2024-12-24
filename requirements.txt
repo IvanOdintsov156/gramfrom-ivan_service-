@@ -1,11 +1,8 @@
-pydantic
-logging
-transformers
-natasha
 torch
+transformers
+sentence-transformers
 nltk
 pymorphy3
 spacy
 pandas
-confluent_kafka
-fastapi
+openpyxl  # Для работы с Excel файлами
